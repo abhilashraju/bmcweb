@@ -113,6 +113,11 @@ class HttpBody::value_type
         return fileSize;
     }
 
+    std::optional<size_t> getFileSize() const
+    {
+        return fileSize;
+    }
+
     void clear()
     {
         strBody.clear();
@@ -164,6 +169,35 @@ class HttpBody::value_type
                 fileSize = static_cast<size_t>(size);
             }
         }
+        ec = {};
+    }
+
+    void setFdWithRange(int fd, off_t offset, size_t length,
+                        boost::system::error_code& ec)
+    {
+        // Seek to the specified offset before assigning to file handle
+        if (offset < 0)
+        {
+            BMCWEB_LOG_ERROR("Invalid negative offset: {}", offset);
+            ec = boost::system::error_code(EINVAL,
+                                           boost::system::generic_category());
+            return;
+        }
+
+        off_t seekResult = ::lseek(fd, offset, SEEK_SET);
+        if (seekResult < 0)
+        {
+            BMCWEB_LOG_ERROR("Failed to seek to offset {}: {}", offset,
+                             strerror(errno));
+            ec = boost::system::error_code(errno,
+                                           boost::system::generic_category());
+            return;
+        }
+
+        // Now assign the fd to the file handle - it's already at the right
+        // position
+        fileHandle.fileHandle.native_handle(fd);
+        fileSize = length;
         ec = {};
     }
 };
@@ -227,8 +261,26 @@ class HttpBody::writer
                             ret.second);
             return ret;
         }
-        size_t readReq = std::min(fileReadBuf.size(), maxSize);
-        BMCWEB_LOG_INFO("Reading {}", readReq);
+
+        // Check if we have a fileSize limit and respect it
+        size_t remainingBytes = std::numeric_limits<size_t>::max();
+        std::optional<size_t> fileSizeLimit = body.getFileSize();
+        if (fileSizeLimit)
+        {
+            if (sent >= *fileSizeLimit)
+            {
+                // Already sent all requested bytes
+                BMCWEB_LOG_INFO("Reached fileSize limit: sent={} fileSize={}",
+                                sent, *fileSizeLimit);
+                ret.second = false;
+                return ret;
+            }
+            remainingBytes = *fileSizeLimit - sent;
+        }
+
+        size_t readReq =
+            std::min({fileReadBuf.size(), maxSize, remainingBytes});
+        BMCWEB_LOG_INFO("Reading {} (remaining={})", readReq, remainingBytes);
         boost::system::error_code readEc;
         size_t read = body.file().read(fileReadBuf.data(), readReq, readEc);
         if (readEc)
@@ -245,9 +297,20 @@ class HttpBody::writer
 
         std::string_view chunkView(fileReadBuf.data(), read);
         BMCWEB_LOG_INFO("Read {} bytes from file", read);
-        // If the number of bytes read equals the amount requested, we haven't
-        // reached EOF yet
-        ret.second = read == readReq;
+        sent += read;
+
+        // Determine if there's more data to send
+        if (fileSizeLimit)
+        {
+            // If we have a size limit, check against it
+            ret.second = sent < *fileSizeLimit;
+        }
+        else
+        {
+            // If the number of bytes read equals the amount requested, we
+            // haven't reached EOF yet
+            ret.second = read == readReq;
+        }
         if (body.encodingType == EncodingType::Base64)
         {
             buf.clear();

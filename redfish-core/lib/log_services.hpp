@@ -615,9 +615,9 @@ inline bool checkSizeLimit(int fd, crow::Response& res)
     constexpr long long int maxFileSize = 20LL * 1024LL * 1024LL;
     if (size > maxFileSize)
     {
-        BMCWEB_LOG_ERROR("File size {} exceeds maximum allowed size of {}",
-                         size, maxFileSize);
-        messages::internalError(res);
+        // BMCWEB_LOG_ERROR("File size {} exceeds maximum allowed size of {}",
+        //                  size, maxFileSize);
+        // messages::internalError(res);
         return false;
     }
     off_t rc = lseek(fd, 0, SEEK_SET);
@@ -628,6 +628,114 @@ inline bool checkSizeLimit(int fd, crow::Response& res)
         return false;
     }
     return true;
+}
+
+inline std::vector<std::pair<std::string, std::string>> generateChunkUrls(
+    uint64_t fileSize, uint64_t chunkSizeMB, const std::string& entryID,
+    const std::string& dumpType)
+{
+    std::vector<std::pair<std::string, std::string>> fileParts;
+
+    // Calculate chunk size in bytes and chunk count
+    uint64_t chunkSize;
+    uint64_t count;
+
+    if (chunkSizeMB == 0)
+    {
+        // chunkSizeMB = 0: use entire file as single chunk
+        chunkSize = fileSize;
+        count = 1;
+    }
+    else
+    {
+        // Convert MB to bytes
+        chunkSize = chunkSizeMB * 1024 * 1024;
+        // Calculate number of chunks needed
+        count = fileSize / chunkSize;
+    }
+
+    BMCWEB_LOG_INFO(
+        "Generating chunk URLs: fileSize {} chunkSizeMB {} chunkSize {} count {}",
+        fileSize, chunkSizeMB, chunkSize, count);
+
+    // Generate URLs for full chunks starting from offset 0
+    for (uint64_t i = 0; i < count; i++)
+    {
+        uint64_t offset = i * chunkSize;
+        std::string url;
+        if (dumpType == "BMC")
+        {
+            url = std::format(
+                "/redfish/v1/Managers/{}/LogServices/Dump/Entries/{}/{}/{}/attachment/",
+                BMCWEB_REDFISH_MANAGER_URI_NAME, entryID, offset, chunkSize);
+        }
+        else
+        {
+            url = std::format(
+                "/redfish/v1/Systems/{}/LogServices/Dump/Entries/{}/{}/{}/attachment/",
+                BMCWEB_REDFISH_SYSTEM_URI_NAME, entryID, offset, chunkSize);
+        }
+        fileParts.emplace_back(std::to_string(i), url);
+    }
+
+    // Add last chunk if there's remaining data
+    uint64_t lastChunkSize = fileSize % chunkSize;
+    if (lastChunkSize > 0)
+    {
+        uint64_t offset = count * chunkSize;
+        std::string url;
+        if (dumpType == "BMC")
+        {
+            url = std::format(
+                "/redfish/v1/Managers/{}/LogServices/Dump/Entries/{}/{}/{}/attachment/",
+                BMCWEB_REDFISH_MANAGER_URI_NAME, entryID, offset,
+                lastChunkSize);
+        }
+        else
+        {
+            url = std::format(
+                "/redfish/v1/Systems/{}/LogServices/Dump/Entries/{}/{}/{}/attachment/",
+                BMCWEB_REDFISH_SYSTEM_URI_NAME, entryID, offset, lastChunkSize);
+        }
+        fileParts.emplace_back(std::to_string(count), url);
+    }
+
+    return fileParts;
+}
+
+inline void upgradeToChunked(
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp, int fd,
+    const std::string& entryID, const std::string& dumpType)
+{
+    asyncResp->res.result(boost::beast::http::status::ok);
+    asyncResp->res.addHeader(boost::beast::http::field::transfer_encoding,
+                             "multipart/file");
+
+    off_t fileSize = lseek(fd, 0, SEEK_END);
+    if (fileSize < 0)
+    {
+        BMCWEB_LOG_ERROR("Failed to get file size");
+        messages::internalError(asyncResp->res);
+        close(fd);
+        return;
+    }
+
+    uint64_t size = static_cast<uint64_t>(fileSize);
+
+    // Define chunk sizes in MB to generate URLs for
+    // 0 = entire file as single chunk, others = chunk size in MB
+    std::vector<uint64_t> chunkSizesMB = {0, 1, 2, 5, 10, 20, 50};
+
+    // Generate chunk URLs for multiple chunk sizes
+    nlohmann::json chunkedResponseJson;
+    for (uint64_t sizeMB : chunkSizesMB)
+    {
+        auto urls = generateChunkUrls(size, sizeMB, entryID, dumpType);
+        chunkedResponseJson[std::to_string(sizeMB)] = urls;
+    }
+
+    asyncResp->res.jsonValue = chunkedResponseJson;
+    close(fd);
 }
 inline void downloadEntryCallback(
     const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
@@ -665,7 +773,9 @@ inline void downloadEntryCallback(
     }
     if (!checkSizeLimit(fd, asyncResp->res))
     {
-        close(fd);
+        BMCWEB_LOG_DEBUG("Exceeded size limit Sending chunked urls");
+        // File exceeds size limit, upgrade to chunked download
+        upgradeToChunked(asyncResp, fd, entryID, downloadEntryType);
         return;
     }
     if (downloadEntryType == "System")
@@ -688,6 +798,95 @@ inline void downloadEntryCallback(
     }
     asyncResp->res.addHeader(boost::beast::http::field::content_type,
                              "application/octet-stream");
+}
+
+inline void handleLogServicesDumpEntryDownloadGetPart(
+    crow::App& app, const std::string& dumpType, const crow::Request& req,
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const std::string& managerId, const std::string& dumpId,
+    const std::string& offset, const std::string& size)
+{
+    if (!redfish::setUpRedfishRoute(app, req, asyncResp))
+    {
+        return;
+    }
+
+    if (managerId != BMCWEB_REDFISH_MANAGER_URI_NAME)
+    {
+        messages::resourceNotFound(asyncResp->res, "Manager", managerId);
+        return;
+    }
+
+    if (dumpType != "BMC")
+    {
+        BMCWEB_LOG_WARNING("Can't find Dump Entry {}", dumpId);
+        messages::resourceNotFound(asyncResp->res, dumpType + " dump", dumpId);
+        return;
+    }
+
+    std::string dumpEntryPath =
+        std::format("{}/entry/{}", getDumpPath(dumpType), dumpId);
+
+    auto downloadDumpEntryHandler =
+        [asyncResp, dumpId, offset,
+         size](const boost::system::error_code& ec,
+               const sdbusplus::message::unix_fd& unixfd) {
+            if (ec.value() == EBADR)
+            {
+                messages::resourceNotFound(asyncResp->res, "EntryAttachment",
+                                           dumpId);
+                return;
+            }
+            if (ec)
+            {
+                BMCWEB_LOG_ERROR("DBUS response error: {}", ec);
+                messages::internalError(asyncResp->res);
+                return;
+            }
+
+            int fd = dup(unixfd);
+            if (fd < 0)
+            {
+                BMCWEB_LOG_ERROR("Failed to open file");
+                messages::internalError(asyncResp->res);
+                return;
+            }
+
+            // Parse offset and size
+            uint64_t offsetVal = 0;
+            uint64_t sizeVal = 0;
+            try
+            {
+                offsetVal = std::stoull(offset);
+                sizeVal = std::stoull(size);
+            }
+            catch (const std::exception& e)
+            {
+                BMCWEB_LOG_ERROR("Invalid offset or size: {}", e.what());
+                messages::internalError(asyncResp->res);
+                close(fd);
+                return;
+            }
+
+            // Use openFdWithRange to efficiently stream the file chunk
+            if (!asyncResp->res.openFdWithRange(fd,
+                                                static_cast<off_t>(offsetVal),
+                                                static_cast<size_t>(sizeVal)))
+            {
+                BMCWEB_LOG_ERROR("Failed to open fd with range");
+                messages::internalError(asyncResp->res);
+                close(fd);
+                return;
+            }
+
+            asyncResp->res.addHeader(boost::beast::http::field::content_type,
+                                     "application/octet-stream");
+        };
+
+    dbus::utility::async_method_call(
+        asyncResp, std::move(downloadDumpEntryHandler),
+        "xyz.openbmc_project.Dump.Manager", dumpEntryPath,
+        "xyz.openbmc_project.Dump.Entry", "GetFileHandle");
 }
 
 inline void downloadDumpEntry(
@@ -2925,6 +3124,12 @@ inline void requestRoutesBMCDumpEntryDownload(App& app)
         .privileges(redfish::privileges::getLogEntry)
         .methods(boost::beast::http::verb::get)(std::bind_front(
             handleLogServicesDumpEntryDownloadGet, std::ref(app), "BMC"));
+    BMCWEB_ROUTE(
+        app,
+        "/redfish/v1/Managers/<str>/LogServices/Dump/Entries/<str>/<str>/<str>/attachment/")
+        .privileges(redfish::privileges::getLogEntry)
+        .methods(boost::beast::http::verb::get)(std::bind_front(
+            handleLogServicesDumpEntryDownloadGetPart, std::ref(app), "BMC"));
 }
 
 inline void requestRoutesBMCDumpCreate(App& app)
